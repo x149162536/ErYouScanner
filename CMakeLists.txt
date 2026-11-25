@@ -38,6 +38,18 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(nlohmann_json)
 
+set(ZXING_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(ZXING_UNIT_TESTS OFF CACHE BOOL "" FORCE)
+set(ZXING_BLACKBOX_TESTS OFF CACHE BOOL "" FORCE)
+
+FetchContent_Declare(
+	zxing
+	GIT_REPOSITORY https://github.com/zxing-cpp/zxing-cpp.git
+	GIT_TAG v2.3.0
+)
+FetchContent_MakeAvailable(zxing)
+include_directories(${zxing_SOURCE_DIR}/core/src)
+
 find_package(unofficial-webview2 CONFIG REQUIRED)
 
 find_package(cpr CONFIG REQUIRED)
@@ -128,6 +140,7 @@ set(PROJECT_LIBRARIES
 	Qt6::Concurrent
 
 	cpr::cpr
+	ZXing::ZXing
 	QR_Code_generator
 	unofficial::webview2::webview2
 	nlohmann_json::nlohmann_json
