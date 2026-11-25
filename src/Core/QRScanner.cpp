@@ -1,3 +1,11 @@
+#pragma once
+
+// windows.h 默认把 min/max 定义成宏，会让 std::max(...) 变成 std::(...) 而报
+// "'(': illegal token on right side of '::'"；在包含任何头之前禁掉宏。
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include "QRScanner.h"
 
 #include <algorithm>
@@ -86,7 +94,7 @@ bool QRScanner::decodeFast(const cv::Mat& img, std::string& qrCode)
 
     // 2) 全屏兜底：超长边先缩小，彩色先转灰度
     cv::Mat view;
-    const double scale = static_cast<double>(FAST_MAX_EDGE) / std::max(img.cols, img.rows);
+    const double scale = static_cast<double>(FAST_MAX_EDGE) / (std::max)(img.cols, img.rows);
     if (scale < 1.0)
     {
         cv::resize(img, view, cv::Size(), scale, scale, cv::INTER_AREA);
