@@ -1129,8 +1129,9 @@ void WindowMain::startAccountSelfCheck()
                 }
                 else if (type == "mhy")
                 {
-                    valid = !token.empty() && !mid.empty() && CheckStokenValid(token, mid);
-                    status = valid ? "有效" : "失效";
+                    // 联网校验已不可靠，列表状态只反映本地凭据是否完整。
+                    valid = !token.empty() && !mid.empty();
+                    status = valid ? "有效" : "缺失";
                 }
             });
             WriteScannerLog(phase + " complete checked=" + std::to_string(checked) + " valid=" + std::to_string(valid));
@@ -1404,7 +1405,9 @@ void WindowMain::pBtstartScreen(bool clicked)
             std::string stoken = account.at("access_key");
             std::string uid = account.at("uid");
             std::string mid = account.at("mid");
-            if (!CheckStokenValid(stoken, mid))
+            // 2026-11-20 起米哈游账号状态接口对有效 SToken 也返回 -100，联网预检会误判“账号校验未通过”。
+            // 只做本地完整性检查，账号是否可用以实际扫码登录结果为准。
+            if (stoken.empty() || uid.empty() || mid.empty())
             {
                 dispatchStartup(generation, [this] { emit AccountError(); });
                 return;
@@ -1526,7 +1529,16 @@ void WindowMain::pBtStream(bool clicked)
             std::string stoken = account.at("access_key");
             std::string uid = account.at("uid");
             std::string mid = account.at("mid");
-            if (!(provider == AccountPlatform::Kuro ? KuroApi(stoken).checkToken().success() : CheckStokenValid(stoken, mid)))
+            // 官方账号不做联网预检（原因同上）；Kuro 账号保持原有校验。
+            if (provider == AccountPlatform::Kuro)
+            {
+                if (!KuroApi(stoken).checkToken().success())
+                {
+                    dispatchStartup(generation, [this] { emit AccountError(); });
+                    return;
+                }
+            }
+            else if (stoken.empty() || uid.empty() || mid.empty())
             {
                 dispatchStartup(generation, [this] { emit AccountError(); });
                 return;
