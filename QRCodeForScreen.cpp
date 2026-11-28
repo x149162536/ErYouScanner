@@ -1,6 +1,8 @@
 #include "QRCodeForScreen.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <limits>
 #include <thread>
 #include <vector>
@@ -15,6 +17,51 @@ namespace
 {
 // 1.5.3 的采集循环末尾也有一条长 Sleep（0x14015682e）：画面没变化时不空转。
 constexpr int kIdleIntervalMs = 200;
+
+// 1.5.3 的采集端：一趟 pass 直接把 BGRA 帧缩成 1280x720 灰度。
+// 原来这里是 cv::resize 到 BGRA（每帧写 3.69MB），扫描端再每帧/miss 转一次灰度；
+// 现在只写 0.92MB，中心 crop、半分辨率、瓦片全部在这张灰度图上零拷贝。
+void downscaleGray(const unsigned char* src, int srcW, int srcH, int srcStride, cv::Mat& dst)
+{
+    constexpr int kDstW = 1280;
+    constexpr int kDstH = 720;
+    if (!src || srcW <= 0 || srcH <= 0 || srcStride < srcW * 4)
+    {
+        dst.release();
+        return;
+    }
+
+    dst.create(kDstH, kDstW, CV_8UC1);
+    const double sx = static_cast<double>(srcW) / kDstW;
+    const double sy = static_cast<double>(srcH) / kDstH;
+    const int spanX = (std::max)(1, (std::min)(2, static_cast<int>(std::lround(sx))));
+    const int spanY = (std::max)(1, (std::min)(2, static_cast<int>(std::lround(sy))));
+
+    cv::parallel_for_(cv::Range(0, kDstH), [&](const cv::Range& range)
+    {
+        for (int y = range.start; y < range.end; ++y)
+        {
+            const int y0 = (std::min)(srcH - 1, static_cast<int>(y * sy));
+            const int y1 = (std::min)(srcH - 1, y0 + spanY - 1);
+            const unsigned char* row0 = src + static_cast<std::size_t>(y0) * srcStride;
+            const unsigned char* row1 = src + static_cast<std::size_t>(y1) * srcStride;
+            unsigned char* out = dst.ptr<unsigned char>(y);
+            for (int x = 0; x < kDstW; ++x)
+            {
+                const int x0 = (std::min)(srcW - 1, static_cast<int>(x * sx));
+                const int x1 = (std::min)(srcW - 1, x0 + spanX - 1);
+                const unsigned char* p00 = row0 + static_cast<std::size_t>(x0) * 4;
+                const unsigned char* p01 = row0 + static_cast<std::size_t>(x1) * 4;
+                const unsigned char* p10 = row1 + static_cast<std::size_t>(x0) * 4;
+                const unsigned char* p11 = row1 + static_cast<std::size_t>(x1) * 4;
+                const unsigned b = p00[0] + p01[0] + p10[0] + p11[0];
+                const unsigned g = p00[1] + p01[1] + p10[1] + p11[1];
+                const unsigned r = p00[2] + p01[2] + p10[2] + p11[2];
+                out[x] = static_cast<unsigned char>((306u * r + 601u * g + 117u * b + 2048u) >> 12);
+            }
+        }
+    });
+}
 
 struct WaitForScreenWorkers
 {
@@ -143,7 +190,8 @@ void QRCodeForScreen::monitorScreen()
                 captureFailed = true;
                 break;
             }
-            cv::resize(cv::Mat(height, width, CV_8UC4, buffer.data()), image, {1280, 720});
+            // 直接产出 1280x720 灰度：扫描端不再做任何颜色转换，也不再拷贝 3.69MB BGRA。
+            downscaleGray(buffer.data(), width, height, width * 4, image);
             lastGoodFrame = image;
         }
         else if (!lastGoodFrame.empty())
