@@ -22,6 +22,10 @@ public:
 	void decodeSingle(const cv::Mat& img, std::string& qrCode);
 	void decodeMultiple(const cv::Mat& img, std::string& qrCode);
 
+	// 最近一次成功命中的路径（center/half/tile/full）与耗时，供 SCANNER_DEBUG 日志使用。
+	std::string lastPath() const { return lastPath_; }
+	long long lastMicros() const { return lastMicros_; }
+
 private:
 	// 在 gray 的 roi 上做一次 zxing 解码；roi 会自动裁剪到图像范围内。
 	bool decodeView(const cv::Mat& gray, const cv::Rect& roi, std::string& qrCode);
@@ -34,6 +38,8 @@ private:
 	// 全分辨率兜底。
 	bool decodeFull(const cv::Mat& gray, std::string& qrCode);
 
+	void markHit(const char* path, std::chrono::steady_clock::time_point started);
+
 	static cv::Mat toGray(const cv::Mat& img);
 
 	ZXing::ReaderOptions zxOptions;
@@ -44,4 +50,6 @@ private:
 	bool timersInit_{ false };
 	// 采集池可能并发调用同一个 scanner，串行化，避免瓦片/deep 计时器互相踩。
 	std::mutex mutex_;
+	std::string lastPath_;
+	long long lastMicros_{ 0 };
 };

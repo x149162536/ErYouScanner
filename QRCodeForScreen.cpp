@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <cstdlib>
 #include <limits>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -17,10 +20,56 @@ namespace
 {
 // 1.5.3 的采集循环末尾也有一条长 Sleep（0x14015682e）：画面没变化时不空转。
 constexpr int kIdleIntervalMs = 200;
+// SCANNER_DEBUG=1：把每次命中的路径/耗时写进 scanner.log。
+const bool kScanDebug = std::getenv("SCANNER_DEBUG") != nullptr;
+// SCANNER_BGRA=1：跳过自写灰度化，回到 OpenCV resize + cvtColor 的旧路径（排障用）。
+const bool kScanBgra = std::getenv("SCANNER_BGRA") != nullptr;
 
 // 1.5.3 的采集端：一趟 pass 直接把 BGRA 帧缩成 1280x720 灰度。
-// 原来这里是 cv::resize 到 BGRA（每帧写 3.69MB），扫描端再每帧/miss 转一次灰度；
-// 现在只写 0.92MB，中心 crop、半分辨率、瓦片全部在这张灰度图上零拷贝。
+// 原来这里是 cv::resize 到 BGRA（每帧写 3.69MB），扫描端再每帧/miss 转一次灰度。
+// 现在按面积加权采样（2x 缩放时正好是 2x2 平均，1.5x 时按覆盖比例加权），
+// 输出 0.92MB 单通道，中心 crop、半分辨率、瓦片全部零拷贝。
+struct AxisTaps
+{
+    int i0 = 0;
+    int i1 = 0;
+    double w0 = 1.0;
+    double w1 = 0.0;
+};
+
+void buildTaps(int dstN, int srcN, std::vector<AxisTaps>& taps)
+{
+    taps.resize(static_cast<std::size_t>(dstN));
+    const double scale = static_cast<double>(srcN) / dstN;
+    for (int d = 0; d < dstN; ++d)
+    {
+        const double a = d * scale;
+        const double b = (d + 1) * scale;
+        if (scale <= 1.0)
+        {
+            const int i = (std::min)(srcN - 1, static_cast<int>(a));
+            taps[d] = { i, i, 1.0, 0.0 };
+            continue;
+        }
+        const int first = (std::min)(srcN - 1, static_cast<int>(std::floor(a)));
+        const int last = (std::min)(srcN - 1, static_cast<int>(std::ceil(b)) - 1);
+        if (last <= first)
+        {
+            taps[d] = { first, first, 1.0, 0.0 };
+            continue;
+        }
+        const double c0 = (first + 1) - a;
+        const double c1 = b - last;
+        const double sum = (std::max)(1e-9, c0 + c1);
+        taps[d] = { first, last, c0 / sum, c1 / sum };
+    }
+}
+
+inline unsigned lumaOf(const unsigned char* p)
+{
+    return (306u * p[2] + 601u * p[1] + 117u * p[0] + 512u) >> 10;
+}
+
 void downscaleGray(const unsigned char* src, int srcW, int srcH, int srcStride, cv::Mat& dst)
 {
     constexpr int kDstW = 1280;
@@ -31,46 +80,100 @@ void downscaleGray(const unsigned char* src, int srcW, int srcH, int srcStride, 
         return;
     }
 
-    dst.create(kDstH, kDstW, CV_8UC1);
-    const double sx = static_cast<double>(srcW) / kDstW;
-    const double sy = static_cast<double>(srcH) / kDstH;
-    const int spanX = (std::max)(1, (std::min)(2, static_cast<int>(std::lround(sx))));
-    const int spanY = (std::max)(1, (std::min)(2, static_cast<int>(std::lround(sy))));
+    // 分辨率变化时重建采样表；同一分辨率下复用。
+    static int cachedW = -1;
+    static int cachedH = -1;
+    static std::vector<AxisTaps> tapX;
+    static std::vector<AxisTaps> tapY;
+    static std::mutex tapMutex;
+    {
+        const std::lock_guard<std::mutex> lock(tapMutex);
+        if (cachedW != srcW || cachedH != srcH)
+        {
+            buildTaps(kDstW, srcW, tapX);
+            buildTaps(kDstH, srcH, tapY);
+            cachedW = srcW;
+            cachedH = srcH;
+        }
+    }
 
+    dst.create(kDstH, kDstW, CV_8UC1);
     cv::parallel_for_(cv::Range(0, kDstH), [&](const cv::Range& range)
     {
         for (int y = range.start; y < range.end; ++y)
         {
-            const int y0 = (std::min)(srcH - 1, static_cast<int>(y * sy));
-            const int y1 = (std::min)(srcH - 1, y0 + spanY - 1);
-            const unsigned char* row0 = src + static_cast<std::size_t>(y0) * srcStride;
-            const unsigned char* row1 = src + static_cast<std::size_t>(y1) * srcStride;
+            const AxisTaps& ty = tapY[static_cast<std::size_t>(y)];
+            const unsigned char* row0 = src + static_cast<std::size_t>(ty.i0) * srcStride;
+            const unsigned char* row1 = src + static_cast<std::size_t>(ty.i1) * srcStride;
             unsigned char* out = dst.ptr<unsigned char>(y);
             for (int x = 0; x < kDstW; ++x)
             {
-                const int x0 = (std::min)(srcW - 1, static_cast<int>(x * sx));
-                const int x1 = (std::min)(srcW - 1, x0 + spanX - 1);
-                const unsigned char* p00 = row0 + static_cast<std::size_t>(x0) * 4;
-                const unsigned char* p01 = row0 + static_cast<std::size_t>(x1) * 4;
-                const unsigned char* p10 = row1 + static_cast<std::size_t>(x0) * 4;
-                const unsigned char* p11 = row1 + static_cast<std::size_t>(x1) * 4;
-                const unsigned b = p00[0] + p01[0] + p10[0] + p11[0];
-                const unsigned g = p00[1] + p01[1] + p10[1] + p11[1];
-                const unsigned r = p00[2] + p01[2] + p10[2] + p11[2];
-                out[x] = static_cast<unsigned char>((306u * r + 601u * g + 117u * b + 2048u) >> 12);
+                const AxisTaps& tx = tapX[static_cast<std::size_t>(x)];
+                const unsigned char* p00 = row0 + static_cast<std::size_t>(tx.i0) * 4;
+                const unsigned char* p10 = row0 + static_cast<std::size_t>(tx.i1) * 4;
+                const unsigned char* p01 = row1 + static_cast<std::size_t>(tx.i0) * 4;
+                const unsigned char* p11 = row1 + static_cast<std::size_t>(tx.i1) * 4;
+
+                const double top = tx.w0 * lumaOf(p00) + tx.w1 * lumaOf(p10);
+                const double bottom = tx.w0 * lumaOf(p01) + tx.w1 * lumaOf(p11);
+                const double value = ty.w0 * top + ty.w1 * bottom;
+                out[x] = static_cast<unsigned char>((std::min)(255.0, (std::max)(0.0, value + 0.5)));
             }
         }
     });
 }
 
-struct WaitForScreenWorkers
+// 采集线程只发布“最新一帧”，扫描线程永远取最新的：不排队、不丢中间帧。
+struct FrameSlot
 {
-    QThreadPool& pool;
-    std::atomic<bool>& running;
-    ~WaitForScreenWorkers()
+    std::mutex mutex;
+    std::condition_variable cv;
+    cv::Mat frame;
+    bool closed = false;
+
+    void push(cv::Mat next)
     {
-        running.store(false);
-        pool.waitForDone();
+        {
+            const std::lock_guard<std::mutex> lock(mutex);
+            frame = std::move(next);
+        }
+        cv.notify_one();
+    }
+
+    bool pop(cv::Mat& out)
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.wait(lock, [this] { return closed || !frame.empty(); });
+        if (closed)
+        {
+            return false;
+        }
+        out = std::move(frame);
+        frame.release();
+        return true;
+    }
+
+    void close()
+    {
+        {
+            const std::lock_guard<std::mutex> lock(mutex);
+            closed = true;
+        }
+        cv.notify_all();
+    }
+};
+
+struct WorkerJoiner
+{
+    FrameSlot& slot;
+    std::thread& worker;
+    ~WorkerJoiner()
+    {
+        slot.close();
+        if (worker.joinable())
+        {
+            worker.join();
+        }
     }
 };
 }
@@ -139,9 +242,82 @@ void QRCodeForScreen::monitorScreen()
     std::vector<unsigned char> buffer(static_cast<std::size_t>(width) * height * 4);
     DXGI_FORMAT lastFormat = DXGI_FORMAT_UNKNOWN;
     cv::Mat lastGoodFrame;
-    QThreadPool pool;
-    pool.setMaxThreadCount(threadNumber);
-    WaitForScreenWorkers waitForWorkers{pool, m_stop};
+    FrameSlot slot;
+    std::thread worker([this, &scanner, &slot]()
+    {
+        while (true)
+        {
+            cv::Mat image;
+            if (!slot.pop(image))
+            {
+                return;
+            }
+            try
+            {
+                if (!m_stop.load() || isInterruptionRequested())
+                {
+                    return;
+                }
+                std::string decoded;
+                scanner.decodeSingle(image, decoded);
+                if (kScanDebug && !decoded.empty())
+                {
+                    WriteScannerLog("qr: path=" + scanner.lastPath() +
+                        " us=" + std::to_string(scanner.lastMicros()) +
+                        " frame=" + std::to_string(image.cols) + "x" + std::to_string(image.rows));
+                }
+                if (kuroAccount)
+                {
+                    if (!m_stop.load() || !KuroApi::isGameQr(decoded)) continue;
+                    const auto status = kuroSession.prepare(decoded, resultGeneration);
+                    if (!m_stop.load() || isInterruptionRequested()) continue;
+                    if (status == ScanRet::UNKNOW) continue;
+                    stop();
+                    if (status == ScanRet::SUCCESS) Q_EMIT loginConfirm(GameType::WutheringWaves, true, resultGeneration);
+                    else Q_EMIT loginResults(status, resultGeneration);
+                    return;
+                }
+                std::string ticket;
+                if (!m_stop.load() || isInterruptionRequested() ||
+                    !parseOfficialQRCode(decoded, ticket) ||
+                    lastTicket == ticket)
+                {
+                    continue;
+                }
+                const std::string passportQrUrl = PandaScanQRCode(scanUrl, ticket, gameType);
+                const bool accepted = !passportQrUrl.empty();
+                if (accepted)
+                {
+                    lastQrCode = passportQrUrl;
+                }
+                if (!m_stop.load() || isInterruptionRequested())
+                {
+                    continue;
+                }
+                if (accepted)
+                {
+                    lastTicket = ticket;
+                    // Stop capture before publishing a confirmation to the UI.
+                    stop();
+                    Q_EMIT loginConfirm(gameType, true, resultGeneration);
+                }
+                else
+                {
+                    stop();
+                    Q_EMIT loginResults(ScanRet::FAILURE_1, resultGeneration);
+                }
+                return;
+            }
+            catch (...)
+            {
+                LogScannerException("screen: QR worker");
+                stop();
+                Q_EMIT loginResults(ScanRet::STREAMERROR, resultGeneration);
+                return;
+            }
+        }
+    });
+    WorkerJoiner joiner{ slot, worker };
     bool captureFailed = false;
     while (m_stop.load() && !isInterruptionRequested())
     {
@@ -190,8 +366,28 @@ void QRCodeForScreen::monitorScreen()
                 captureFailed = true;
                 break;
             }
-            // 直接产出 1280x720 灰度：扫描端不再做任何颜色转换，也不再拷贝 3.69MB BGRA。
-            downscaleGray(buffer.data(), width, height, width * 4, image);
+            if (kScanBgra || width > 3000)
+            {
+                // OpenCV 路径：4K（3x 以上降采样，自写 2-tap 会混叠）或排障回退。
+                const cv::Mat bgra(height, width, CV_8UC4, buffer.data());
+                if (kScanBgra)
+                {
+                    cv::Mat small;
+                    cv::resize(bgra, small, { 1280, 720 });
+                    cv::cvtColor(small, image, cv::COLOR_BGRA2GRAY);
+                }
+                else
+                {
+                    cv::Mat full;
+                    cv::cvtColor(bgra, full, cv::COLOR_BGRA2GRAY);
+                    cv::resize(full, image, { 1280, 720 }, 0, 0, cv::INTER_AREA);
+                }
+            }
+            else
+            {
+                // 直接产出 1280x720 灰度：扫描端不再做任何颜色转换，也不再拷贝 3.69MB BGRA。
+                downscaleGray(buffer.data(), width, height, width * 4, image);
+            }
             lastGoodFrame = image;
         }
         else if (!lastGoodFrame.empty())
@@ -204,70 +400,18 @@ void QRCodeForScreen::monitorScreen()
             cv::imshow("Video_Stream", image);
             cv::waitKey(1);
 #endif
-            pool.tryStart([this, &scanner, image = std::move(image)]() {
-                try
-                {
-                    if (!m_stop.load() || isInterruptionRequested())
-                    {
-                        return;
-                    }
-                    std::string decoded;
-                    scanner.decodeSingle(image, decoded);
-                    if (kuroAccount)
-                    {
-                        if (!m_stop.load() || !KuroApi::isGameQr(decoded)) return;
-                        const auto status = kuroSession.prepare(decoded, resultGeneration);
-                        if (!m_stop.load() || isInterruptionRequested()) return;
-                        if (status == ScanRet::UNKNOW) return;
-                        stop();
-                        if (status == ScanRet::SUCCESS) Q_EMIT loginConfirm(GameType::WutheringWaves, true, resultGeneration);
-                        else Q_EMIT loginResults(status, resultGeneration);
-                        return;
-                    }
-                    std::string ticket;
-                    if (!m_stop.load() || isInterruptionRequested() ||
-                        !parseOfficialQRCode(decoded, ticket) ||
-                        lastTicket == ticket)
-                    {
-                        return;
-                    }
-                    const std::string passportQrUrl = PandaScanQRCode(scanUrl, ticket, gameType);
-                    const bool accepted = !passportQrUrl.empty();
-                    if (accepted)
-                    {
-                        lastQrCode = passportQrUrl;
-                    }
-                    if (!m_stop.load() || isInterruptionRequested())
-                    {
-                        return;
-                    }
-                    if (accepted)
-                    {
-                        lastTicket = ticket;
-                        // Stop capture before publishing a confirmation to the UI.
-                        stop();
-                        Q_EMIT loginConfirm(gameType, true, resultGeneration);
-                    }
-                    else
-                    {
-                        stop();
-                        Q_EMIT loginResults(ScanRet::FAILURE_1, resultGeneration);
-                    }
-                }
-                catch (...)
-                {
-                    LogScannerException("screen: QR worker");
-                    stop();
-                    Q_EMIT loginResults(ScanRet::STREAMERROR, resultGeneration);
-                }
-            });
+            slot.push(std::move(image));
         }
         // 有新帧：按识别间隔（可低到 1ms）；没新帧：睡 200ms，别空转重解同一帧。
         const int sleepMs = (result == 0) ? m_scanIntervalMs.load() : kIdleIntervalMs;
         std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
     }
+    slot.close();
+    if (worker.joinable())
+    {
+        worker.join();
+    }
     const bool reportCaptureFailure = captureFailed && m_stop.exchange(false);
-    pool.waitForDone();
     if (reportCaptureFailure)
     {
         Q_EMIT loginResults(ScanRet::STREAMERROR, resultGeneration);

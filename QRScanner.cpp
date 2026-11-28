@@ -232,6 +232,9 @@ bool QRScanner::decodeFull(const cv::Mat& gray, std::string& qrCode)
 void QRScanner::decodeSingle(const cv::Mat& img, std::string& qrCode)
 {
 	const std::lock_guard<std::mutex> lock(mutex_);
+	const auto started = std::chrono::steady_clock::now();
+	lastPath_.clear();
+	lastMicros_ = 0;
 	qrCode.clear();
 	if (img.empty())
 	{
@@ -249,6 +252,7 @@ void QRScanner::decodeSingle(const cv::Mat& img, std::string& qrCode)
 	// 1) 每帧：中心灰度块（1.5.3 的快路径）
 	if (decodeCenter(img, qrCode))
 	{
+		markHit("center", started);
 		return;
 	}
 
@@ -260,6 +264,7 @@ void QRScanner::decodeSingle(const cv::Mat& img, std::string& qrCode)
 	}
 	if (decodeHalf(gray, qrCode))
 	{
+		markHit("half", started);
 		return;
 	}
 
@@ -271,6 +276,7 @@ void QRScanner::decodeSingle(const cv::Mat& img, std::string& qrCode)
 		lastTile_ = now;
 		if (decodeTiles(gray, qrCode))
 		{
+			markHit("tile", started);
 			return;
 		}
 	}
@@ -281,9 +287,17 @@ void QRScanner::decodeSingle(const cv::Mat& img, std::string& qrCode)
 		lastDeep_ = now;
 		if (decodeFull(gray, qrCode))
 		{
+			markHit("full", started);
 			return;
 		}
 	}
+}
+
+void QRScanner::markHit(const char* path, std::chrono::steady_clock::time_point started)
+{
+	lastPath_ = path;
+	lastMicros_ = std::chrono::duration_cast<std::chrono::microseconds>(
+		std::chrono::steady_clock::now() - started).count();
 }
 
 void QRScanner::decodeMultiple(const cv::Mat& img, std::string& qrCode)
