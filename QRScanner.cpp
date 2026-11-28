@@ -231,6 +231,7 @@ bool QRScanner::decodeFull(const cv::Mat& gray, std::string& qrCode)
 
 void QRScanner::decodeSingle(const cv::Mat& img, std::string& qrCode)
 {
+	const std::lock_guard<std::mutex> lock(mutex_);
 	qrCode.clear();
 	if (img.empty())
 	{

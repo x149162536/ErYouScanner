@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <mutex>
 #include <string>
 
 #include <opencv2/opencv.hpp>
@@ -41,4 +42,6 @@ private:
 	std::chrono::steady_clock::time_point lastTile_{};
 	std::chrono::steady_clock::time_point lastDeep_{};
 	bool timersInit_{ false };
+	// 采集池可能并发调用同一个 scanner，串行化，避免瓦片/deep 计时器互相踩。
+	std::mutex mutex_;
 };
